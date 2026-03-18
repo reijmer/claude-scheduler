@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-scheduler"
+version = "0.1.0"
+description = "Interactive scheduler for recurring Claude Code tasks"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "questionary>=2.0.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+claude-scheduler = "claude_scheduler.cli:main"
+claude-scheduler-runner = "claude_scheduler.runner:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_scheduler"]
