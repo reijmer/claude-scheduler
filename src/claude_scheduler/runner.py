@@ -59,37 +59,52 @@ def _reset_terminal():
 
 
 def _run_foreground(job, cwd, run_id, output_file) -> int:
-    """Run claude directly with inherited terminal. No pipes, no buffering."""
-    cmd = ["claude", "-p", job.prompt]
+    """Run claude directly via os.system() for full terminal passthrough."""
+    cmd_parts = ["claude", "-p", shlex.quote(job.prompt)]
     if job.skip_perms:
-        cmd.append("--dangerously-skip-permissions")
+        cmd_parts.append("--dangerously-skip-permissions")
     if job.model:
-        cmd.extend(["--model", job.model])
+        cmd_parts.extend(["--model", shlex.quote(job.model)])
+
+    shell_cmd = " ".join(cmd_parts)
 
     # Reset terminal to sane state -- questionary/prompt_toolkit may have
     # left it in raw mode with signals disabled
     _reset_terminal()
 
+    # Debug: show terminal state
+    try:
+        fd = sys.stdin.fileno()
+        attrs = termios.tcgetattr(fd)
+        flags = attrs[3]
+        print(f"[debug] stdin fd={fd}, isatty={os.isatty(fd)}")
+        print(f"[debug] ECHO={bool(flags & termios.ECHO)}, ICANON={bool(flags & termios.ICANON)}, ISIG={bool(flags & termios.ISIG)}")
+        print(f"[debug] stdout fd={sys.stdout.fileno()}, isatty={os.isatty(sys.stdout.fileno())}")
+    except Exception as e:
+        print(f"[debug] terminal check failed: {e}")
+
     print(f"Running job '{job.name}' in {job.directory}")
-    print(f"Command: {shlex.join(cmd)}")
+    print(f"Command: {shell_cmd}")
     print(f"Working directory: {cwd}")
     sys.stdout.flush()
+    sys.stderr.flush()
 
-    # Run claude with fully inherited stdio -- no pipes, no buffering.
-    # Claude gets the real terminal. Ctrl+C works because the terminal
-    # sends SIGINT to the entire foreground process group.
-    cancelled = False
+    # Use os.system() which runs through /bin/sh and gets a clean terminal
+    # context. subprocess.run() inherits Python's potentially broken fd state.
+    saved_cwd = os.getcwd()
     try:
-        result = subprocess.run(cmd, cwd=str(cwd))
-        exit_code = result.returncode
-    except KeyboardInterrupt:
-        cancelled = True
-        exit_code = 130
-        print("\n\nJob cancelled.")
-    except FileNotFoundError:
-        print("Error: claude command not found. Is Claude Code installed?", file=sys.stderr)
-        _save_run(run_id, output_file, datetime.now().isoformat(), 1, error="claude not found")
+        os.chdir(str(cwd))
+        exit_status = os.system(shell_cmd)
+        # os.system returns the wait status, not the exit code
+        exit_code = os.waitstatus_to_exitcode(exit_status) if hasattr(os, 'waitstatus_to_exitcode') else (exit_status >> 8)
+    except Exception as e:
+        print(f"Error running command: {e}", file=sys.stderr)
+        _save_run(run_id, output_file, datetime.now().isoformat(), 1, error=str(e))
         return 1
+    finally:
+        os.chdir(saved_cwd)
+
+    cancelled = exit_code == 130  # SIGINT
 
     finished_at = datetime.now().isoformat()
 
