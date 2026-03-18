@@ -2,9 +2,11 @@
 
 import fcntl
 import json
+import os
 import shlex
 import subprocess
 import sys
+import termios
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +37,27 @@ def _save_run(run_id: int, output_file: str, finished_at: str, exit_code: int, *
         conn.close()
 
 
+def _reset_terminal():
+    """Reset terminal to sane state after questionary/prompt_toolkit."""
+    try:
+        fd = sys.stdin.fileno()
+        # Save and restore terminal attributes to cooked mode
+        attrs = termios.tcgetattr(fd)
+        # Ensure ECHO and ICANON are on (cooked mode)
+        attrs[3] |= termios.ECHO | termios.ICANON
+        # Ensure ISIG is on (so Ctrl+C generates SIGINT)
+        attrs[3] |= termios.ISIG
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except (termios.error, ValueError, OSError):
+        # Not a terminal (e.g. piped), skip
+        pass
+    # Also run stty sane as a belt-and-suspenders fix
+    try:
+        subprocess.run(["stty", "sane"], stdin=sys.stdin, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def _run_foreground(job, cwd, run_id, output_file) -> int:
     """Run claude directly with inherited terminal. No pipes, no buffering."""
     cmd = ["claude", "-p", job.prompt]
@@ -43,10 +66,14 @@ def _run_foreground(job, cwd, run_id, output_file) -> int:
     if job.model:
         cmd.extend(["--model", job.model])
 
+    # Reset terminal to sane state -- questionary/prompt_toolkit may have
+    # left it in raw mode with signals disabled
+    _reset_terminal()
+
     print(f"Running job '{job.name}' in {job.directory}")
     print(f"Command: {shlex.join(cmd)}")
     print(f"Working directory: {cwd}")
-    print()
+    sys.stdout.flush()
 
     # Run claude with fully inherited stdio -- no pipes, no buffering.
     # Claude gets the real terminal. Ctrl+C works because the terminal
