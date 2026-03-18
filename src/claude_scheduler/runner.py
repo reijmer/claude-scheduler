@@ -2,12 +2,10 @@
 
 import fcntl
 import json
-import os
-import selectors
 import shlex
-import signal
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -38,17 +36,8 @@ def _save_run(run_id: int, output_file: str, finished_at: str, exit_code: int, *
         conn.close()
 
 
-def _process_line(line: str, events: list, full_text: list) -> None:
-    """Parse a stream-json line and print relevant output."""
-    if not line:
-        return
-    try:
-        event = json.loads(line)
-    except json.JSONDecodeError:
-        print(line, flush=True)
-        return
-
-    events.append(event)
+def _process_event(event: dict, full_text: list) -> None:
+    """Display a stream-json event to the terminal."""
     msg_type = event.get("type", "")
 
     if msg_type == "message":
@@ -80,7 +69,6 @@ def _process_line(line: str, events: list, full_text: list) -> None:
                     print(f"\n> [{tool_name}] {target}", flush=True)
                 else:
                     print(f"\n> [{tool_name}]", flush=True)
-            # Skip thinking blocks
     elif msg_type == "result":
         result_text = event.get("result", "")
         if isinstance(result_text, str) and result_text and not full_text:
@@ -95,7 +83,7 @@ def _process_line(line: str, events: list, full_text: list) -> None:
 
 
 def _run_foreground(job, cwd, run_id, output_file) -> int:
-    """Run claude with stream-json, showing live output and capturing results."""
+    """Run claude with stream-json, showing live output. Ctrl+C kills claude."""
     cmd = [
         "claude", "-p", job.prompt,
         "--output-format", "stream-json",
@@ -111,6 +99,8 @@ def _run_foreground(job, cwd, run_id, output_file) -> int:
     print(f"Working directory: {cwd}")
     print()
 
+    # Use a thread to read stdout so the main thread stays interruptible by Ctrl+C.
+    # The subprocess shares our process group, so Ctrl+C sends SIGINT to both us and claude.
     proc = subprocess.Popen(
         cmd,
         cwd=str(cwd),
@@ -118,89 +108,71 @@ def _run_foreground(job, cwd, run_id, output_file) -> int:
         stderr=subprocess.PIPE,
     )
 
-    # Install signal handler so Ctrl+C immediately kills the child
-    # (the default for line in proc.stdout blocks in C I/O and defers KeyboardInterrupt)
-    cancelled = False
-
-    def _handle_sigint(signum, frame):
-        nonlocal cancelled
-        cancelled = True
-        proc.terminate()
-
-    old_handler = signal.signal(signal.SIGINT, _handle_sigint)
-    old_tstp = signal.signal(signal.SIGTSTP, _handle_sigint)  # Ctrl+Z
-
-    # Collect all stream events and show assistant text live
     events = []
     full_text = []
-    line_buf = b""
 
-    try:
-        # Use selectors for non-blocking read so signal handler can fire
-        sel = selectors.DefaultSelector()
-        sel.register(proc.stdout, selectors.EVENT_READ)
-        sel.register(proc.stderr, selectors.EVENT_READ)
-
-        stdout_done = False
-        stderr_done = False
-        stderr_chunks = []
-
-        while not (stdout_done and stderr_done) and not cancelled:
-            for key, _ in sel.select(timeout=0.1):
-                chunk = os.read(key.fd, 8192)
-                if key.fileobj is proc.stdout:
-                    if not chunk:
-                        stdout_done = True
-                        continue
-                    line_buf += chunk
-                    while b"\n" in line_buf:
-                        raw_line, line_buf = line_buf.split(b"\n", 1)
-                        _process_line(raw_line.decode("utf-8", errors="replace").strip(), events, full_text)
-                else:
-                    if not chunk:
-                        stderr_done = True
-                        continue
-                    stderr_chunks.append(chunk)
-
-            # Check if process exited
-            if proc.poll() is not None and not cancelled:
-                # Drain remaining stdout
-                if proc.stdout:
-                    remaining = proc.stdout.read()
-                    if remaining:
-                        line_buf += remaining
-                while b"\n" in line_buf:
-                    raw_line, line_buf = line_buf.split(b"\n", 1)
-                    _process_line(raw_line.decode("utf-8", errors="replace").strip(), events, full_text)
-                if line_buf.strip():
-                    _process_line(line_buf.decode("utf-8", errors="replace").strip(), events, full_text)
-                # Drain remaining stderr
-                if proc.stderr:
-                    remaining = proc.stderr.read()
-                    if remaining:
-                        stderr_chunks.append(remaining)
+    def _read_stdout():
+        """Read stdout in a background thread, parse and display events."""
+        buf = b""
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
                 break
+            buf += chunk
+            while b"\n" in buf:
+                raw_line, buf = buf.split(b"\n", 1)
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                    events.append(event)
+                    _process_event(event, full_text)
+                except json.JSONDecodeError:
+                    print(line, flush=True)
+        # Process remaining buffer
+        if buf.strip():
+            line = buf.decode("utf-8", errors="replace").strip()
+            try:
+                event = json.loads(line)
+                events.append(event)
+                _process_event(event, full_text)
+            except json.JSONDecodeError:
+                print(line, flush=True)
 
-        sel.close()
-    finally:
-        signal.signal(signal.SIGINT, old_handler)
-        signal.signal(signal.SIGTSTP, old_tstp)
+    stderr_output = []
 
-    # Ensure process is dead
-    if proc.poll() is None:
-        proc.terminate()
+    def _read_stderr():
+        """Read stderr in a background thread."""
+        while True:
+            chunk = proc.stderr.read(4096)
+            if not chunk:
+                break
+            stderr_output.append(chunk)
+
+    stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
+    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    # Main thread: wait for process. Ctrl+C raises KeyboardInterrupt here,
+    # AND sends SIGINT to claude (same process group), so claude also exits.
+    cancelled = False
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        cancelled = True
+        # claude already got SIGINT from the terminal. Give it a moment to exit.
         try:
-            proc.wait(timeout=5)
+            proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
-    proc.wait()
-
-    if cancelled:
+            proc.wait()
         print("\n\nJob cancelled.")
 
-    stderr_output = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
-    if stderr_output:
-        print(f"\n[stderr] {stderr_output}", file=sys.stderr)
+    # Wait for reader threads to finish draining
+    stdout_thread.join(timeout=2)
+    stderr_thread.join(timeout=2)
 
     finished_at = datetime.now().isoformat()
     exit_code = proc.returncode
@@ -216,7 +188,7 @@ def _run_foreground(job, cwd, run_id, output_file) -> int:
             session_id = event.get("session_id")
             break
 
-    # Save full stream to output file
+    # Save output
     output_data = {
         "mode": "foreground",
         "events": events,
@@ -226,13 +198,20 @@ def _run_foreground(job, cwd, run_id, output_file) -> int:
         "cost_usd": cost_usd,
         "duration_ms": duration_ms,
     }
-    Path(output_file).write_text(json.dumps(output_data, indent=2))
+    try:
+        Path(output_file).write_text(json.dumps(output_data, indent=2, default=str))
+    except Exception:
+        Path(output_file).write_text(json.dumps({"error": "failed to serialize output"}, indent=2))
+
+    stderr_text = b"".join(stderr_output).decode("utf-8", errors="replace").strip()
+    if stderr_text:
+        print(f"\n[stderr] {stderr_text}", file=sys.stderr)
 
     error_msg = None
     if cancelled:
         error_msg = "Cancelled by user (Ctrl+C)"
     elif exit_code != 0:
-        error_msg = stderr_output.strip() or f"Exit code {exit_code}"
+        error_msg = stderr_text or f"Exit code {exit_code}"
 
     # Print summary
     print()
