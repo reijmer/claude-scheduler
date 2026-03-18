@@ -59,7 +59,7 @@ def _reset_terminal():
 
 
 def _run_foreground(job, cwd, run_id, output_file) -> int:
-    """Run claude directly via os.system() for full terminal passthrough."""
+    """Run claude via os.system(), piped through formatter for pretty output."""
     cmd_parts = [
         "claude", "-p", shlex.quote(job.prompt),
         "--output-format", "stream-json",
@@ -70,23 +70,24 @@ def _run_foreground(job, cwd, run_id, output_file) -> int:
     if job.model:
         cmd_parts.extend(["--model", shlex.quote(job.model)])
 
-    shell_cmd = " ".join(cmd_parts)
+    # Find the Python that has our package installed
+    formatter_python = sys.executable
+    claude_cmd = " ".join(cmd_parts)
+    # Pipe stream-json through our formatter for pretty output
+    shell_cmd = f"{claude_cmd} | {shlex.quote(formatter_python)} -m claude_scheduler.formatter"
 
     # Reset terminal to sane state -- questionary/prompt_toolkit may have
     # left it in raw mode with signals disabled
     _reset_terminal()
 
     print(f"Running job '{job.name}' in {job.directory}")
-    print(f"Command: claude -p '...' --output-format stream-json --verbose" + (" --dangerously-skip-permissions" if job.skip_perms else ""))
-    print(f"Working directory: {cwd}")
-    print(f"Ctrl+C to cancel. Output is raw JSON (stream-json mode).")
+    print(f"Ctrl+C to cancel.")
     print()
     sys.stdout.flush()
     sys.stderr.flush()
 
     # Use os.system() which runs through /bin/sh and gives claude full
-    # terminal access. stream-json output goes directly to the terminal
-    # so the user sees progress events as they happen.
+    # terminal access. Piped through formatter for readable output.
     saved_cwd = os.getcwd()
     try:
         os.chdir(str(cwd))
