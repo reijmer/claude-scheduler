@@ -5,7 +5,6 @@ import json
 import shlex
 import subprocess
 import sys
-import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -36,59 +35,9 @@ def _save_run(run_id: int, output_file: str, finished_at: str, exit_code: int, *
         conn.close()
 
 
-def _process_event(event: dict, full_text: list) -> None:
-    """Display a stream-json event to the terminal."""
-    msg_type = event.get("type", "")
-
-    if msg_type == "message":
-        content = event.get("content", [])
-        if not isinstance(content, list):
-            return
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            block_type = block.get("type", "")
-            if block_type == "text":
-                text = block.get("text", "")
-                if isinstance(text, str) and text:
-                    print(text, end="", flush=True)
-                    full_text.append(text)
-            elif block_type == "tool_use":
-                tool_name = block.get("name", "?")
-                tool_input = block.get("input", {})
-                if not isinstance(tool_input, dict):
-                    tool_input = {}
-                if tool_name == "Bash":
-                    desc = tool_input.get("description", tool_input.get("command", ""))
-                    print(f"\n> [{tool_name}] {desc}", flush=True)
-                elif tool_name in ("Read", "Glob", "Grep"):
-                    target = tool_input.get("file_path") or tool_input.get("pattern") or tool_input.get("path", "")
-                    print(f"\n> [{tool_name}] {target}", flush=True)
-                elif tool_name in ("Edit", "Write"):
-                    target = tool_input.get("file_path", "")
-                    print(f"\n> [{tool_name}] {target}", flush=True)
-                else:
-                    print(f"\n> [{tool_name}]", flush=True)
-    elif msg_type == "result":
-        result_text = event.get("result", "")
-        if isinstance(result_text, str) and result_text and not full_text:
-            print(result_text, flush=True)
-            full_text.append(result_text)
-    elif msg_type == "error":
-        print(f"\n[ERROR] {event.get('error', event)}", file=sys.stderr, flush=True)
-    elif msg_type == "system":
-        msg = event.get("message") or event.get("subtype", "")
-        if msg:
-            print(f"[system] {msg}", flush=True)
-
-
 def _run_foreground(job, cwd, run_id, output_file) -> int:
-    """Run claude with stream-json, showing live output. Ctrl+C kills claude."""
-    cmd = [
-        "claude", "-p", job.prompt,
-        "--output-format", "stream-json",
-        "--verbose",
-    ]
+    """Run claude directly with inherited terminal. No pipes, no buffering."""
+    cmd = ["claude", "-p", job.prompt]
     if job.skip_perms:
         cmd.append("--dangerously-skip-permissions")
     if job.model:
@@ -99,133 +48,46 @@ def _run_foreground(job, cwd, run_id, output_file) -> int:
     print(f"Working directory: {cwd}")
     print()
 
-    # Use a thread to read stdout so the main thread stays interruptible by Ctrl+C.
-    # The subprocess shares our process group, so Ctrl+C sends SIGINT to both us and claude.
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-
-    events = []
-    full_text = []
-
-    def _read_stdout():
-        """Read stdout in a background thread, parse and display events."""
-        buf = b""
-        while True:
-            chunk = proc.stdout.read(4096)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf:
-                raw_line, buf = buf.split(b"\n", 1)
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    events.append(event)
-                    _process_event(event, full_text)
-                except json.JSONDecodeError:
-                    print(line, flush=True)
-        # Process remaining buffer
-        if buf.strip():
-            line = buf.decode("utf-8", errors="replace").strip()
-            try:
-                event = json.loads(line)
-                events.append(event)
-                _process_event(event, full_text)
-            except json.JSONDecodeError:
-                print(line, flush=True)
-
-    stderr_output = []
-
-    def _read_stderr():
-        """Read stderr in a background thread."""
-        while True:
-            chunk = proc.stderr.read(4096)
-            if not chunk:
-                break
-            stderr_output.append(chunk)
-
-    stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
-    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
-    stdout_thread.start()
-    stderr_thread.start()
-
-    # Main thread: wait for process. Ctrl+C raises KeyboardInterrupt here,
-    # AND sends SIGINT to claude (same process group), so claude also exits.
+    # Run claude with fully inherited stdio -- no pipes, no buffering.
+    # Claude gets the real terminal. Ctrl+C works because the terminal
+    # sends SIGINT to the entire foreground process group.
     cancelled = False
     try:
-        proc.wait()
+        result = subprocess.run(cmd, cwd=str(cwd))
+        exit_code = result.returncode
     except KeyboardInterrupt:
         cancelled = True
-        # claude already got SIGINT from the terminal. Give it a moment to exit.
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        exit_code = 130
         print("\n\nJob cancelled.")
-
-    # Wait for reader threads to finish draining
-    stdout_thread.join(timeout=2)
-    stderr_thread.join(timeout=2)
+    except FileNotFoundError:
+        print("Error: claude command not found. Is Claude Code installed?", file=sys.stderr)
+        _save_run(run_id, output_file, datetime.now().isoformat(), 1, error="claude not found")
+        return 1
 
     finished_at = datetime.now().isoformat()
-    exit_code = proc.returncode
 
-    # Extract cost/duration from the final result event
-    cost_usd = None
-    duration_ms = None
-    session_id = None
-    for event in reversed(events):
-        if event.get("type") == "result":
-            cost_usd = event.get("total_cost_usd")
-            duration_ms = event.get("duration_ms")
-            session_id = event.get("session_id")
-            break
-
-    # Save output
-    output_data = {
+    summary = {
         "mode": "foreground",
-        "events": events,
-        "full_text": "".join(str(t) for t in full_text),
         "exit_code": exit_code,
         "cancelled": cancelled,
-        "cost_usd": cost_usd,
-        "duration_ms": duration_ms,
+        "prompt": job.prompt,
+        "directory": job.directory,
     }
-    try:
-        Path(output_file).write_text(json.dumps(output_data, indent=2, default=str))
-    except Exception:
-        Path(output_file).write_text(json.dumps({"error": "failed to serialize output"}, indent=2))
-
-    stderr_text = b"".join(stderr_output).decode("utf-8", errors="replace").strip()
-    if stderr_text:
-        print(f"\n[stderr] {stderr_text}", file=sys.stderr)
+    Path(output_file).write_text(json.dumps(summary, indent=2))
 
     error_msg = None
     if cancelled:
         error_msg = "Cancelled by user (Ctrl+C)"
     elif exit_code != 0:
-        error_msg = stderr_text or f"Exit code {exit_code}"
+        error_msg = f"Exit code {exit_code}"
 
-    # Print summary
     print()
-    cost_str = f"${cost_usd:.4f}" if cost_usd else "unknown"
-    dur_str = f"{duration_ms / 1000:.1f}s" if duration_ms else "unknown"
     status = "cancelled" if cancelled else ("OK" if exit_code == 0 else f"failed ({exit_code})")
-    print(f"--- {status} | cost: {cost_str} | duration: {dur_str} ---")
+    print(f"--- {status} ---")
 
-    _save_run(
-        run_id, output_file, finished_at, exit_code,
-        cost_usd=cost_usd, duration_ms=duration_ms, session_id=session_id, error=error_msg,
-    )
+    _save_run(run_id, output_file, finished_at, exit_code, error=error_msg)
 
-    return 130 if cancelled else exit_code
+    return exit_code
 
 
 def _run_background(job, cmd, cwd, run_id, output_file) -> int:
