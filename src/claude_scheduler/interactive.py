@@ -282,52 +282,6 @@ def prompt_view_history(job=None) -> None:
         display.show_run_output(run)
 
 
-def prompt_doctor() -> None:
-    import shutil
-
-    console.print("\n[bold]Health Check[/bold]\n")
-
-    # Check claude on PATH
-    claude_path = shutil.which("claude")
-    if claude_path:
-        console.print(f"[green]claude found: {claude_path}[/green]")
-    else:
-        console.print("[red]claude not found on PATH[/red]")
-
-    # Check runner on PATH
-    runner_path = shutil.which("claude-scheduler-runner")
-    if runner_path:
-        console.print(f"[green]claude-scheduler-runner found: {runner_path}[/green]")
-    else:
-        console.print("[red]claude-scheduler-runner not found on PATH[/red]")
-
-    # Check cron entries vs DB
-    jobs = db.list_jobs()
-    entries = cron.list_cron_entries()
-
-    for job in jobs:
-        if job.enabled:
-            if cron.verify_cron_job(job.name):
-                console.print(f"[green]Cron OK: {job.name}[/green]")
-            else:
-                console.print(f"[red]Cron MISSING: {job.name} (enabled in DB but no cron entry)[/red]")
-        else:
-            console.print(f"[dim]Cron skipped: {job.name} (disabled)[/dim]")
-
-    orphan_markers = set()
-    for entry in entries:
-        for part in entry.split("# claude-scheduler:"):
-            if part.strip() and part.strip() not in [j.name for j in jobs]:
-                orphan_markers.add(part.strip())
-    for orphan in orphan_markers:
-        console.print(f"[yellow]Orphan cron entry: {orphan} (no matching job in DB)[/yellow]")
-
-    if not jobs:
-        console.print("[dim]No jobs configured yet.[/dim]")
-
-    console.print()
-
-
 def main_menu() -> None:
     jobs = db.list_jobs()
     display.show_dashboard(jobs)
@@ -340,7 +294,6 @@ def main_menu() -> None:
                 "View jobs",
                 "Run a job now",
                 "View run history",
-                "Doctor (health check)",
                 "Quit",
             ],
         ).ask()
@@ -357,7 +310,5 @@ def main_menu() -> None:
             prompt_run_job()
         elif action == "View run history":
             prompt_view_history()
-        elif action == "Doctor (health check)":
-            prompt_doctor()
 
         console.print()

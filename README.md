@@ -21,7 +21,6 @@ An interactive terminal tool for scheduling recurring [Claude Code](https://docs
   View jobs
   Run a job now
   View run history
-  Doctor (health check)
   Quit
 ```
 
@@ -116,21 +115,6 @@ Pick from common schedules or enter a custom cron expression:
 | Every weekday (9am) | `0 9 * * 1-5` |
 | Custom | any valid cron expression |
 
-### Health check
-
-Run the built-in doctor to verify your setup:
-
-```
-$ claude-scheduler doctor
-
-Health Check
-
-claude found: /opt/homebrew/bin/claude
-claude-scheduler-runner found: /usr/local/bin/claude-scheduler-runner
-Cron OK: weekly-cleanup
-Cron OK: sentry-check
-```
-
 ## Non-interactive commands
 
 For scripting or quick access:
@@ -141,7 +125,6 @@ claude-scheduler list                 # List all jobs
 claude-scheduler list --json          # List as JSON
 claude-scheduler history <job-name>   # Show run history
 claude-scheduler log <run-id>         # Show full output of a run
-claude-scheduler doctor               # Health check
 ```
 
 ## How it works

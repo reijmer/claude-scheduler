@@ -68,12 +68,6 @@ def main() -> None:
             show_run_output(run)
             sys.exit(0)
 
-        elif command == "doctor":
-            from .interactive import prompt_doctor
-
-            prompt_doctor()
-            sys.exit(0)
-
         elif command in ("--help", "-h", "help"):
             print_help()
             sys.exit(0)
@@ -104,7 +98,6 @@ Usage:
   claude-scheduler list [--json]       List all jobs
   claude-scheduler history <job-name>  Show run history for a job
   claude-scheduler log <run-id>        Show full output of a run
-  claude-scheduler doctor              Health check
   claude-scheduler --version           Show version
   claude-scheduler --help              Show this help"""
     print(help_text)
